@@ -1,0 +1,162 @@
+# Valeurs par défaut (surchargées par values-dev.yaml / values-staging.yaml / values-prod.yaml).
+# Aucun secret ici : ils viennent d'Azure Key Vault (keyVault.enabled) ou, pour un cluster
+# local de test uniquement, d'un fichier secrets.local.yaml non versionné (localSecrets).
+
+environment: dev
+
+image:
+  registry: acrresaflow.azurecr.io      # remplacé par la sortie Terraform acr_login_server
+  tag: "1.0.0"                          # remplacé par le SHA du commit dans le pipeline
+  pullPolicy: IfNotPresent
+  api: resaflow-api
+  worker: resaflow-worker
+  frontend: resaflow-frontend
+
+config:
+  logLevel: INFO
+  otelEnabled: true
+  otelEndpoint: http://tempo.monitoring.svc.cluster.local:4318
+  smtpHost: ""                          # vide => mailpit interne si mailpit.enabled
+  smtpPort: "1025"
+  smtpFrom: "ResaFlow <no-reply@resaflow.dev>"
+  storageAccountUrl: ""                 # https://<compte>.blob.core.windows.net (sortie Terraform)
+  exportRetentionDays: "7"
+  adminEmail: admin@resaflow.dev
+
+# --- Azure : Workload Identity + Key Vault (Secrets Store CSI Driver) ---------------
+azure:
+  tenantId: ""
+  workloadIdentityClientId: ""          # identité managée de l'application (sortie Terraform)
+
+keyVault:
+  enabled: true
+  name: ""                              # sortie Terraform key_vault_name
+  # Noms des secrets dans Key Vault (préfixés par environnement par Terraform)
+  secrets:
+    DATABASE_URL: database-url
+    JWT_SECRET: jwt-secret
+    CELERY_BROKER_URL: celery-broker-url
+    ADMIN_PASSWORD: admin-password
+    POSTGRES_PASSWORD: postgres-password
+    RABBITMQ_PASSWORD: rabbitmq-password
+
+# Cluster local (kind/minikube) uniquement : --values secrets.local.yaml
+localSecrets: {}
+
+serviceAccount:
+  name: resaflow
+
+# --- API -----------------------------------------------------------------------------
+api:
+  replicas: 2
+  resources:
+    requests: { cpu: 100m, memory: 192Mi }
+    limits: { cpu: 500m, memory: 384Mi }
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  pdb:
+    minAvailable: 1
+
+# Déploiement canary (piloté par le pipeline) : 2e Deployment + Ingress canary pondéré
+canary:
+  enabled: false
+  tag: ""
+  weight: 10                            # % du trafic /api envoyé au canary
+  replicas: 1
+
+# --- Worker / Beat -------------------------------------------------------------------
+worker:
+  replicas: 1
+  concurrency: 4
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 70
+  # FinOps : le worker tolère les nœuds Spot (tâches idempotentes, acks tardifs)
+  spot: true
+
+beat:
+  resources:
+    requests: { cpu: 20m, memory: 128Mi }
+    limits: { cpu: 200m, memory: 256Mi }
+
+# --- Front-end -----------------------------------------------------------------------
+frontend:
+  replicas: 2
+  resources:
+    requests: { cpu: 20m, memory: 32Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+  pdb:
+    minAvailable: 1
+
+# --- Exposition ----------------------------------------------------------------------
+ingress:
+  enabled: true                         # Traefik (IngressRoute) + cert-manager
+  host: resaflow.example.com
+  clusterIssuer: letsencrypt-prod
+  authRateLimitRps: 5                   # anti brute-force sur /api/v1/auth
+
+# --- Données in-cluster (dev/staging) ------------------------------------------------
+postgresql:
+  enabled: true                         # false en prod : Azure Database for PostgreSQL (Terraform)
+  image: postgres:17-alpine
+  database: resaflow
+  user: resaflow
+  storageClass: managed-csi             # disque Azure chiffré au repos (SSE)
+  size: 8Gi
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+externalDatabase:
+  cidr: 10.20.2.0/24                    # sous-réseau délégué au serveur PostgreSQL flexible
+
+rabbitmq:
+  image: rabbitmq:4-management
+  user: resaflow
+  storageClass: managed-csi
+  size: 2Gi
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+mailpit:
+  enabled: true                         # serveur SMTP de démonstration (aucun e-mail réel envoyé)
+  image: axllent/mailpit:v1.27
+
+azurite:
+  enabled: false                        # émulateur Blob pour un cluster local sans Azure (jamais en cloud)
+  image: mcr.microsoft.com/azure-storage/azurite:3.37.0
+
+# --- Sauvegardes ---------------------------------------------------------------------
+backup:
+  enabled: true
+  schedule: "30 2 * * *"
+  pgImage: postgres:17-alpine
+
+# --- Supervision ---------------------------------------------------------------------
+monitoring:
+  enabled: true
+  releaseLabel: kube-prometheus-stack   # label attendu par l'opérateur Prometheus
+  dashboards: false                     # true dans un seul environnement (prod) pour éviter les doublons
+  slo:
+    availabilityTarget: 0.995           # 99,5 % des requêtes /api sans erreur 5xx (30 j)
+    errorBudget: 0.005                  # = 1 - availabilityTarget
+    latencyTarget: 0.95                 # 95 % des requêtes /api en moins de 300 ms
+    latencyThresholdSeconds: "0.3"
+
+# RBAC : groupe Entra ID autorisé en lecture/exploitation sur le namespace
+rbac:
+  operatorsGroupObjectId: ""
+
+networkPolicies:
+  enabled: true
+  ingressNamespace: traefik
+  monitoringNamespace: monitoring

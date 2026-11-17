@@ -1,0 +1,22 @@
+# Production (namespace resaflow-prod) : base managée Azure, haute disponibilité applicative
+environment: prod
+config:
+  logLevel: INFO
+api:
+  resources:
+    requests: { cpu: 100m, memory: 192Mi }
+    limits: { cpu: 500m, memory: 384Mi }
+  autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 10, targetCPUUtilizationPercentage: 70 }
+  pdb: { minAvailable: 1 }
+worker:
+  autoscaling: { enabled: true, minReplicas: 1, maxReplicas: 5, targetCPUUtilizationPercentage: 70 }
+frontend:
+  replicas: 2
+  pdb: { minAvailable: 1 }
+# Azure Database for PostgreSQL Flexible Server (chiffrement au repos + TLS imposé, PITR 7 jours)
+postgresql:
+  enabled: false
+backup:
+  enabled: true
+monitoring:
+  dashboards: true

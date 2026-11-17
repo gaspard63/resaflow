@@ -1,0 +1,338 @@
+# Pipeline applicatif : qualité + sécurité -> build/scan/push des images -> dev -> staging -> prod (canary)
+#
+#  pull_request : lint, tests, SAST, secrets, scans IaC/Dockerfile, rendu Helm (aucun accès à Azure)
+#  push main    : + build et scan des images, push ACR, déploiement continu dev et staging (rolling update),
+#                 puis production en canary après approbation manuelle (environnement GitHub "production")
+#
+# Authentification Azure par OIDC (fédération d'identité) : aucun secret Azure stocké dans GitHub.
+# Actions tierces épinglées par SHA de commit (protection contre la compromission d'un tag, A.8.25).
+name: pipeline
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**", "**.md", "infra/terraform/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_VERSION: "3.13"
+  NODE_VERSION: "24"
+
+jobs:
+  # ===================================================================== QUALITÉ & SÉCURITÉ
+  backend:
+    name: Back-end — lint, SAST, tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: resaflow_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U test" --health-interval 5s --health-timeout 3s --health-retries 10
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Lint (ruff)
+        run: ruff check . --output-format=github
+      - name: SAST (bandit)
+        run: bandit -c pyproject.toml -r app -ll
+      - name: Vulnérabilités connues des dépendances (pip-audit)
+        run: pip-audit -r requirements.txt
+      - name: Migrations Alembic via la CLI (même commande que le Job Kubernetes) + aller-retour
+        env:
+          DATABASE_URL: postgresql+psycopg://test:test@localhost:5432/resaflow_test
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+          alembic upgrade head
+          alembic downgrade base
+      - name: Tests unitaires et d'intégration (PostgreSQL réel, migrations Alembic)
+        env:
+          TEST_DATABASE_URL: postgresql+psycopg://test:test@localhost:5432/resaflow_test
+        run: pytest --cov-report=xml
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: backend-coverage
+          path: backend/coverage.xml
+
+  frontend:
+    name: Front-end — lint, tests, build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run lint
+      - run: npm test
+      - name: Audit des dépendances (vulnérabilités hautes et critiques)
+        run: npm audit --omit=dev --audit-level=high
+      - run: npm run build
+
+  security:
+    name: Secrets, Dockerfiles, IaC
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # publication des rapports SARIF dans l'onglet Security
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Détection de secrets (gitleaks, tout l'historique)
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Lint Dockerfile back-end (hadolint)
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: backend/Dockerfile
+          failure-threshold: error
+      - name: Lint Dockerfile front-end (hadolint)
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: frontend/Dockerfile
+          failure-threshold: error
+      - name: Mauvaises configurations IaC, Kubernetes, Dockerfile (Trivy)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          format: sarif
+          output: trivy-config.sarif
+          exit-code: "0" # constats publiés et triés dans l'onglet Security (exceptions justifiées : docs/securite-iso27001.md)
+      - uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: always()
+        with:
+          sarif_file: trivy-config.sarif
+          category: trivy-config
+
+  helm:
+    name: Chart Helm — lint, rendu, validation des schémas
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - name: Installer kubeconform
+        run: |
+          curl -sSfL https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz | tar xz -C /usr/local/bin kubeconform
+      - name: helm lint + kubeconform (dev, staging, prod, prod canary)
+        run: |
+          set -euo pipefail
+          CHART=deploy/helm/resaflow
+          COMMON=(--set azure.tenantId=t --set azure.workloadIdentityClientId=c --set keyVault.name=kv
+                  --set config.storageAccountUrl=https://st.blob.core.windows.net --set ingress.host=ci.example.com)
+          for case in "dev" "staging" "prod" "prod --set canary.enabled=true --set canary.tag=next"; do
+            read -r env extra <<<"$case"
+            echo "::group::$case"
+            helm lint "$CHART" -f "$CHART/values-$env.yaml" "${COMMON[@]}" $extra
+            helm template resaflow "$CHART" -n "resaflow-$env" -f "$CHART/values-$env.yaml" "${COMMON[@]}" $extra \
+              | kubeconform -strict -summary -kubernetes-version 1.33.0 -schema-location default \
+                  -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+            echo "::endgroup::"
+          done
+
+  # ===================================================================== BUILD, SCAN, PUSH
+  images:
+    name: Image ${{ matrix.image }}
+    if: github.event_name != 'pull_request'
+    needs: [backend, frontend, security, helm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write          # jeton OIDC pour Azure
+      security-events: write
+    strategy:
+      matrix:
+        include:
+          - { image: resaflow-api, context: backend, target: api }
+          - { image: resaflow-worker, context: backend, target: worker }
+          - { image: resaflow-frontend, context: frontend, target: runtime }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build (chargée localement pour le scan, avant tout push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          target: ${{ matrix.target }}
+          build-args: APP_VERSION=${{ github.sha }}
+          load: true
+          tags: ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          provenance: false
+      - name: Scan de vulnérabilités de l'image (bloquant sur CRITICAL corrigeable)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: SBOM (CycloneDX)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}
+          format: cyclonedx
+          output: sbom-${{ matrix.image }}.json
+          scan-type: image
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-${{ matrix.image }}
+          path: sbom-${{ matrix.image }}.json
+      - name: Connexion Azure (OIDC)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID_DEPLOY }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Push vers Azure Container Registry
+        run: |
+          az acr login --name "${{ vars.ACR_NAME }}"
+          docker push "${{ vars.ACR_LOGIN_SERVER }}/${{ matrix.image }}:${{ github.sha }}"
+
+  # ===================================================================== DÉPLOIEMENTS
+  deploy-dev:
+    name: Déploiement dev (rolling update)
+    needs: images
+    runs-on: ubuntu-latest
+    environment:
+      name: dev
+      url: ${{ format('https://{0}', steps.deploy.outputs.host) }}
+    permissions: { contents: read, id-token: write }
+    env: &deploy-env
+      ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+      KEY_VAULT_NAME: ${{ vars.KEY_VAULT_NAME }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      STORAGE_ACCOUNT_URL: ${{ vars.STORAGE_ACCOUNT_URL }}
+      INGRESS_IP: ${{ vars.INGRESS_IP }}
+      OPERATORS_GROUP_ID: ${{ vars.OPERATORS_GROUP_ID }}
+      APP_IDENTITY_CLIENT_ID_DEV: ${{ vars.APP_IDENTITY_CLIENT_ID_DEV }}
+      APP_IDENTITY_CLIENT_ID_STAGING: ${{ vars.APP_IDENTITY_CLIENT_ID_STAGING }}
+      APP_IDENTITY_CLIENT_ID_PROD: ${{ vars.APP_IDENTITY_CLIENT_ID_PROD }}
+    steps:
+      - &checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - &login
+        name: Connexion Azure (OIDC)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID_DEPLOY }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - &tools
+        name: Outils Kubernetes
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - &kubelogin
+        uses: azure/use-kubelogin@0ce7c36141aa27d4934872cf00b0120804c98a29 # v1.3
+        with:
+          kubelogin-version: v0.2.21
+      - &kubeconfig
+        name: kubeconfig (Entra ID, sans compte local)
+        run: |
+          az aks get-credentials -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "${{ vars.AKS_NAME }}" --overwrite-existing
+          kubelogin convert-kubeconfig -l azurecli
+      - id: deploy
+        run: |
+          ./scripts/ci/helm-deploy.sh dev "${{ github.sha }}"
+      - name: Tests de fumée
+        run: ./scripts/ci/smoke-test.sh "https://${{ steps.deploy.outputs.host }}"
+
+  deploy-staging:
+    name: Déploiement staging (rolling update + tests de fumée)
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: ${{ format('https://{0}', steps.deploy.outputs.host) }}
+    permissions: { contents: read, id-token: write }
+    env: *deploy-env
+    steps:
+      - *checkout
+      - *login
+      - *tools
+      - *kubelogin
+      - *kubeconfig
+      - id: deploy
+        run: |
+          ./scripts/ci/helm-deploy.sh staging "${{ github.sha }}"
+      - name: Tests de fumée
+        run: ./scripts/ci/smoke-test.sh "https://${{ steps.deploy.outputs.host }}"
+      - name: Test de charge léger (k6) — vérifie le SLO de latence avant la prod
+        uses: grafana/setup-k6-action@43b9fc21641a76002687994433dd586f56e791b1 # v1.2.2
+      - run: k6 run -e BASE_URL="https://${{ steps.deploy.outputs.host }}" -e VUS=10 -e DURATION=1m loadtest/k6-api.js
+
+  deploy-prod:
+    name: Production — canary puis promotion
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    # Approbation manuelle obligatoire (règle de protection de l'environnement GitHub "production")
+    environment:
+      name: production
+      url: ${{ format('https://{0}', steps.promote.outputs.host) }}
+    permissions: { contents: read, id-token: write }
+    env: *deploy-env
+    steps:
+      - *checkout
+      - *login
+      - *tools
+      - *kubelogin
+      - *kubeconfig
+      - name: Version stable actuelle
+        id: current
+        run: |
+          TAG="$(helm get values resaflow -n resaflow-prod -o json 2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin).get("image",{}).get("tag",""))' || true)"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Version stable : ${TAG:-aucune (premier déploiement)}"
+      - name: 1. Canary — 10 % du trafic /api vers la nouvelle version
+        id: canary
+        if: steps.current.outputs.tag != '' && steps.current.outputs.tag != github.sha
+        run: |
+          ./scripts/ci/helm-deploy.sh prod "${{ steps.current.outputs.tag }}" \
+            --set canary.enabled=true --set canary.tag="${{ github.sha }}" --set canary.weight=10
+      - name: 2. Tests de fumée sur le canary (en-tête X-Canary)
+        if: steps.canary.outcome == 'success'
+        run: |
+          ./scripts/ci/smoke-test.sh "https://${{ steps.canary.outputs.host }}" "X-Canary: always"
+      - name: 3. Analyse canary (erreurs 5xx et latence p95 dans Prometheus)
+        if: steps.canary.outcome == 'success'
+        run: ./scripts/ci/canary-analysis.sh "https://${{ steps.canary.outputs.host }}" resaflow-prod 300
+      - name: 4. Promotion — rolling update de la version stable, suppression du canary
+        id: promote
+        run: |
+          ./scripts/ci/helm-deploy.sh prod "${{ github.sha }}" --set canary.enabled=false
+      - name: Tests de fumée post-promotion
+        run: ./scripts/ci/smoke-test.sh "https://${{ steps.promote.outputs.host }}"
+      - name: Retour arrière du canary en cas d'échec
+        if: failure() && steps.canary.outcome == 'success'
+        run: |
+          echo "::error::Canary rejeté : retour à la version ${{ steps.current.outputs.tag }}"
+          ./scripts/ci/helm-deploy.sh prod "${{ steps.current.outputs.tag }}" --set canary.enabled=false

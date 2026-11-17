@@ -1,0 +1,61 @@
+{{- /*
+Migrations Alembic + amorçage (compte admin, ressources de démo), exécutés AVANT la mise à jour
+des pods lors d'une mise à jour (hook pre-upgrade). À la première installation, le job tourne
+après la création des ressources (post-install) car la base in-cluster doit d'abord exister. En canary, le schéma est migré avec l'image du canary : les migrations
+doivent donc rester rétrocompatibles (stratégie expand/contract, voir docs/runbook.md).
+*/ -}}
+{{- $tag := ternary .Values.canary.tag .Values.image.tag .Values.canary.enabled -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: resaflow-migrate
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    helm.sh/hook: post-install,pre-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation   # job conservé 1 h pour consulter les logs
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        {{- include "resaflow.selector" (dict "ctx" . "component" "migrate") | nindent 8 }}
+        {{- include "resaflow.podLabels" (dict "ctx" .) | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      automountServiceAccountToken: false
+      {{- include "resaflow.podSecurity" (dict) | nindent 6 }}
+      {{- if .Values.postgresql.enabled }}
+      initContainers:
+        # Au premier déploiement, la base in-cluster n'est pas encore prête
+        - name: wait-db
+          image: {{ .Values.postgresql.image }}
+          command: ["sh", "-c", "until pg_isready -h resaflow-postgresql -p 5432; do echo attente base; sleep 3; done"]
+          {{- include "resaflow.containerSecurity" . | nindent 10 }}
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 100m, memory: 64Mi }
+      {{- end }}
+      containers:
+        - name: migrate
+          image: {{ include "resaflow.image" (dict "ctx" . "name" .Values.image.worker "tag" $tag) }}
+          command: ["sh", "-c", "alembic upgrade head && python -m app.cli seed"]
+          {{- include "resaflow.backendEnv" . | nindent 10 }}
+            - name: ADMIN_PASSWORD
+              valueFrom: { secretKeyRef: { name: {{ include "resaflow.secretName" . }}, key: ADMIN_PASSWORD } }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+          {{- include "resaflow.containerSecurity" . | nindent 10 }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            {{- include "resaflow.kvMount" . | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 16Mi }
+        {{- include "resaflow.kvVolume" . | nindent 8 }}

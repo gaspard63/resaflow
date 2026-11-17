@@ -1,0 +1,69 @@
+{{- /*
+Sauvegarde quotidienne de la base (A.8.13) :
+  1. initContainer postgres : pg_dump compressé dans un volume temporaire
+  2. conteneur applicatif   : envoi vers Blob Storage (conteneur "backups") par Workload Identity
+Fonctionne avec la base in-cluster (dev/staging) comme avec le serveur PostgreSQL Azure (prod),
+en complément des sauvegardes automatiques (PITR 7 j) du service managé.
+*/ -}}
+{{- if .Values.backup.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: resaflow-db-backup
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  timeZone: Europe/Paris
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 1800
+      template:
+        metadata:
+          labels:
+            {{- include "resaflow.selector" (dict "ctx" . "component" "backup") | nindent 12 }}
+            {{- include "resaflow.podLabels" (dict "ctx" .) | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ .Values.serviceAccount.name }}
+          automountServiceAccountToken: false
+          {{- include "resaflow.podSecurity" (dict) | nindent 10 }}
+          initContainers:
+            - name: dump
+              image: {{ .Values.backup.pgImage }}
+              # DATABASE_URL est au format SQLAlchemy : on retire le "+psycopg" pour libpq
+              command: ["sh", "-c", "set -eu; pg_dump --no-owner --no-privileges \"$(echo \"$DATABASE_URL\" | sed 's/+psycopg//')\" | gzip -9 > /backup/dump.sql.gz; ls -l /backup"]
+              env:
+                - name: DATABASE_URL
+                  valueFrom: { secretKeyRef: { name: {{ include "resaflow.secretName" . }}, key: DATABASE_URL } }
+              resources:
+                requests: { cpu: 50m, memory: 64Mi }
+                limits: { cpu: 500m, memory: 256Mi }
+              {{- include "resaflow.containerSecurity" . | nindent 14 }}
+              volumeMounts:
+                - { name: backup, mountPath: /backup }
+                {{- include "resaflow.kvMount" . | nindent 16 }}
+          containers:
+            - name: upload
+              image: {{ include "resaflow.image" (dict "ctx" . "name" .Values.image.worker) }}
+              command: ["python", "-m", "app.cli", "upload-backup", "/backup/dump.sql.gz"]
+              {{- include "resaflow.backendEnv" . | nindent 14 }}
+              resources:
+                requests: { cpu: 20m, memory: 96Mi }
+                limits: { cpu: 300m, memory: 256Mi }
+              {{- include "resaflow.containerSecurity" . | nindent 14 }}
+              volumeMounts:
+                - { name: backup, mountPath: /backup, readOnly: true }
+                - { name: tmp, mountPath: /tmp }
+          volumes:
+            - name: backup
+              emptyDir: { sizeLimit: 2Gi }
+            - name: tmp
+              emptyDir: { sizeLimit: 16Mi }
+            {{- include "resaflow.kvVolume" . | nindent 12 }}
+{{- end }}

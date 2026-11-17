@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: resaflow-config
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+data:
+  APP_ENV: {{ .Values.environment | quote }}
+  APP_VERSION: {{ .Values.image.tag | quote }}
+  LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  STORAGE_BACKEND: azure
+  {{- if .Values.azurite.enabled }}
+  # Clé publique documentée de l'émulateur Azurite (cluster local uniquement, n'ouvre aucun accès à Azure)
+  AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://resaflow-azurite:10000/devstoreaccount1;"
+  {{- else }}
+  AZURE_STORAGE_ACCOUNT_URL: {{ required "config.storageAccountUrl requis (sortie Terraform storage_account_url)" .Values.config.storageAccountUrl | quote }}
+  {{- end }}
+  # Conteneurs propres à l'environnement (l'identité de l'environnement n'a accès qu'à ceux-là)
+  UPLOADS_CONTAINER: {{ printf "uploads-%s" .Values.environment | quote }}
+  EXPORTS_CONTAINER: {{ printf "exports-%s" .Values.environment | quote }}
+  BACKUPS_CONTAINER: {{ printf "backups-%s" .Values.environment | quote }}
+  SMTP_HOST: {{ .Values.config.smtpHost | default (ternary "resaflow-mailpit" "localhost" .Values.mailpit.enabled) | quote }}
+  SMTP_PORT: {{ .Values.config.smtpPort | quote }}
+  SMTP_FROM: {{ .Values.config.smtpFrom | quote }}
+  EXPORT_RETENTION_DAYS: {{ .Values.config.exportRetentionDays | quote }}
+  OTEL_ENABLED: {{ .Values.config.otelEnabled | quote }}
+  OTEL_EXPORTER_OTLP_ENDPOINT: {{ .Values.config.otelEndpoint | quote }}
+  WORKER_METRICS_PORT: "9100"
+  ADMIN_EMAIL: {{ .Values.config.adminEmail | quote }}

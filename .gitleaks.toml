@@ -1,0 +1,12 @@
+# Configuration gitleaks : règles par défaut + exceptions justifiées (revue obligatoire en PR).
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Faux positifs documentés"
+regexes = [
+  # Clé PUBLIQUE et documentée de l'émulateur Azurite (n'ouvre aucun accès à Azure)
+  '''Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==''',
+  # Secret JWT factice des tests unitaires
+  '''test-secret-with-enough-length-0123456789''',
+]

@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: resaflow
+    folder: ResaFlow
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

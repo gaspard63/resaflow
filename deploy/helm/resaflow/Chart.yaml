@@ -1,0 +1,9 @@
+apiVersion: v2
+name: resaflow
+description: ResaFlow — réservation de ressources (front React, API FastAPI, worker Celery)
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+kubeVersion: ">=1.30.0-0"
+maintainers:
+  - name: Gaspard Sadourny

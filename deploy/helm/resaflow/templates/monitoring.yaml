@@ -1,0 +1,179 @@
+{{- if .Values.monitoring.enabled }}
+{{- $ns := .Release.Namespace -}}
+{{- $slo := .Values.monitoring.slo -}}
+# Collecte des métriques par l'opérateur Prometheus (kube-prometheus-stack)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: resaflow
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+    release: {{ .Values.monitoring.releaseLabel }}
+spec:
+  selector:
+    matchExpressions:
+      - { key: app.kubernetes.io/component, operator: In, values: [api, worker, rabbitmq] }
+  podTargetLabels: [app.kubernetes.io/component, resaflow.io/track]
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+    - port: metrics
+      path: /metrics
+      interval: 15s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: resaflow
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+    release: {{ .Values.monitoring.releaseLabel }}
+spec:
+  groups:
+    # ------------------------------------------------------------------ SLI (règles d'enregistrement)
+    - name: resaflow.sli
+      interval: 30s
+      rules:
+        {{- range $w := list "5m" "30m" "1h" "6h" "1d" "30d" }}
+        # Disponibilité : part des requêtes /api en erreur serveur (5xx) sur {{ $w }}
+        - record: resaflow:api_error_ratio:rate{{ $w }}
+          expr: |
+            sum(rate(http_requests_total{namespace="{{ $ns }}", handler=~"/api/.*", status=~"5.."}[{{ $w }}]))
+            /
+            clamp_min(sum(rate(http_requests_total{namespace="{{ $ns }}", handler=~"/api/.*"}[{{ $w }}])), 1e-9)
+        # Latence : part des requêtes /api servies en moins de {{ $slo.latencyThresholdSeconds }} s sur {{ $w }}
+        - record: resaflow:api_latency_good_ratio:rate{{ $w }}
+          expr: |
+            sum(rate(http_request_duration_seconds_bucket{namespace="{{ $ns }}", handler=~"/api/.*", le="{{ $slo.latencyThresholdSeconds }}"}[{{ $w }}]))
+            /
+            clamp_min(sum(rate(http_request_duration_seconds_count{namespace="{{ $ns }}", handler=~"/api/.*"}[{{ $w }}])), 1e-9)
+        {{- end }}
+        - record: resaflow:api_requests:rate5m
+          expr: sum by (resaflow_io_track) (rate(http_requests_total{namespace="{{ $ns }}", handler=~"/api/.*"}[5m]))
+        - record: resaflow:api_error_ratio_by_track:rate5m
+          expr: |
+            sum by (resaflow_io_track) (rate(http_requests_total{namespace="{{ $ns }}", handler=~"/api/.*", status=~"5.."}[5m]))
+            /
+            clamp_min(sum by (resaflow_io_track) (rate(http_requests_total{namespace="{{ $ns }}", handler=~"/api/.*"}[5m])), 1e-9)
+        - record: resaflow:api_latency_p95:5m
+          expr: histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{namespace="{{ $ns }}", handler=~"/api/.*"}[5m])))
+        - record: resaflow:error_budget_remaining:30d
+          expr: 1 - (resaflow:api_error_ratio:rate30d / {{ $slo.errorBudget }})
+
+    # ------------------------------------------------------------------ Alertes SLO (burn rate multi-fenêtres)
+    - name: resaflow.slo-alerts
+      rules:
+        - alert: ResaflowErrorBudgetFastBurn
+          # 14,4x le rythme nominal : 2 % du budget mensuel consommé en 1 h
+          expr: |
+            resaflow:api_error_ratio:rate1h > (14.4 * {{ $slo.errorBudget }})
+            and resaflow:api_error_ratio:rate5m > (14.4 * {{ $slo.errorBudget }})
+          for: 2m
+          labels: { severity: critical, slo: availability, namespace: {{ $ns }} }
+          annotations:
+            summary: "ResaFlow ({{ $ns }}) consomme son budget d'erreur 14x trop vite"
+            description: "Taux d'erreurs 5xx de l'API : {{ "{{" }} $value | humanizePercentage {{ "}}" }} sur 1 h (SLO {{ $slo.availabilityTarget }})."
+            runbook_url: https://github.com/<votre-compte>/resaflow/blob/main/docs/runbook.md#erreurs-5xx
+        - alert: ResaflowErrorBudgetSlowBurn
+          expr: |
+            resaflow:api_error_ratio:rate6h > (6 * {{ $slo.errorBudget }})
+            and resaflow:api_error_ratio:rate30m > (6 * {{ $slo.errorBudget }})
+          for: 15m
+          labels: { severity: warning, slo: availability, namespace: {{ $ns }} }
+          annotations:
+            summary: "ResaFlow ({{ $ns }}) : budget d'erreur en baisse continue"
+        - alert: ResaflowLatencySLOBreach
+          expr: resaflow:api_latency_good_ratio:rate1h < {{ $slo.latencyTarget }} and resaflow:api_latency_good_ratio:rate5m < {{ $slo.latencyTarget }}
+          for: 10m
+          labels: { severity: warning, slo: latency, namespace: {{ $ns }} }
+          annotations:
+            summary: "ResaFlow ({{ $ns }}) : SLO de latence non tenu ({{ $slo.latencyTarget }} des requêtes sous {{ $slo.latencyThresholdSeconds }} s)"
+            runbook_url: https://github.com/<votre-compte>/resaflow/blob/main/docs/runbook.md#latence
+
+    # ------------------------------------------------------------------ Alertes d'exploitation
+    - name: resaflow.ops
+      rules:
+        - alert: ResaflowApiUnavailable
+          expr: kube_deployment_status_replicas_available{namespace="{{ $ns }}", deployment="resaflow-api"} < 1
+          for: 2m
+          labels: { severity: critical, namespace: {{ $ns }} }
+          annotations: { summary: "Aucun pod API disponible dans {{ $ns }}" }
+        - alert: ResaflowWorkerTasksFailing
+          expr: sum(rate(resaflow_worker_tasks_total{namespace="{{ $ns }}", state="failure"}[10m])) > 0.05
+          for: 10m
+          labels: { severity: warning, namespace: {{ $ns }} }
+          annotations: { summary: "Des tâches de fond échouent de façon répétée ({{ $ns }})" }
+        - alert: ResaflowQueueBacklog
+          expr: sum(rabbitmq_queue_messages_ready{namespace="{{ $ns }}", queue="resaflow"}) > 100
+          for: 10m
+          labels: { severity: warning, namespace: {{ $ns }} }
+          annotations: { summary: "Plus de 100 tâches en attente dans la file ({{ $ns }}) : workers saturés ou arrêtés" }
+        - alert: ResaflowBackupFailed
+          expr: kube_job_status_failed{namespace="{{ $ns }}", job_name=~"resaflow-db-backup-.*"} > 0
+          labels: { severity: critical, namespace: {{ $ns }} }
+          annotations:
+            summary: "La sauvegarde de la base a échoué ({{ $ns }})"
+            runbook_url: https://github.com/<votre-compte>/resaflow/blob/main/docs/runbook.md#sauvegardes
+        - alert: ResaflowBackupMissing
+          expr: time() - max(kube_cronjob_status_last_successful_time{namespace="{{ $ns }}", cronjob="resaflow-db-backup"}) > 26 * 3600
+          labels: { severity: warning, namespace: {{ $ns }} }
+          annotations: { summary: "Aucune sauvegarde réussie depuis plus de 26 h ({{ $ns }})" }
+        - alert: ResaflowAuthBruteForce
+          expr: sum(rate(resaflow_auth_attempts_total{namespace="{{ $ns }}", outcome="failure"}[5m])) > 1
+          for: 5m
+          labels: { severity: warning, category: security, namespace: {{ $ns }} }
+          annotations: { summary: "Plus d'un échec de connexion par seconde : tentative de force brute probable ({{ $ns }})" }
+        - alert: ResaflowAccessDeniedSpike
+          expr: sum(increase(resaflow_access_denied_total{namespace="{{ $ns }}"}[15m])) > 20
+          labels: { severity: warning, category: security, namespace: {{ $ns }} }
+          annotations: { summary: "Nombreux refus d'accès RBAC ({{ $ns }}) : escalade de privilèges tentée ?" }
+        - alert: ResaflowHpaAtMax
+          expr: |
+            kube_horizontalpodautoscaler_status_current_replicas{namespace="{{ $ns }}"}
+            >= kube_horizontalpodautoscaler_spec_max_replicas{namespace="{{ $ns }}"}
+          for: 15m
+          labels: { severity: warning, namespace: {{ $ns }} }
+          annotations: { summary: "L'HPA {{ "{{" }} $labels.horizontalpodautoscaler {{ "}}" }} est au maximum depuis 15 min" }
+        - alert: ResaflowPodCrashLooping
+          expr: increase(kube_pod_container_status_restarts_total{namespace="{{ $ns }}"}[15m]) > 3
+          labels: { severity: warning, namespace: {{ $ns }} }
+          annotations: { summary: "Le pod {{ "{{" }} $labels.pod {{ "}}" }} redémarre en boucle" }
+        - alert: ResaflowVolumeAlmostFull
+          expr: |
+            kubelet_volume_stats_available_bytes{namespace="{{ $ns }}"}
+            / kubelet_volume_stats_capacity_bytes{namespace="{{ $ns }}"} < 0.15
+          for: 10m
+          labels: { severity: warning, namespace: {{ $ns }} }
+          annotations: { summary: "Le volume {{ "{{" }} $labels.persistentvolumeclaim {{ "}}" }} est plein à plus de 85 %" }
+        {{- if .Values.ingress.enabled }}
+        # A.8.24 : le renouvellement automatique (cert-manager, J-30) a échoué si l'échéance passe sous 14 jours.
+        # Le label namespace du certificat devient exported_namespace selon la configuration du scrape : les deux sont couverts.
+        - alert: ResaflowCertificateExpiringSoon
+          expr: |
+            (certmanager_certificate_expiration_timestamp_seconds{name="resaflow-tls", exported_namespace="{{ $ns }}"}
+              or certmanager_certificate_expiration_timestamp_seconds{name="resaflow-tls", namespace="{{ $ns }}"})
+            - time() < 14 * 86400
+          for: 1h
+          labels: { severity: warning, namespace: {{ $ns }} }
+          annotations: { summary: "Le certificat TLS de {{ $ns }} expire dans moins de 14 jours (renouvellement automatique en échec)" }
+        {{- end }}
+{{- if .Values.monitoring.dashboards }}
+---
+# Tableaux de bord Grafana chargés automatiquement par le sidecar (label grafana_dashboard)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: resaflow-dashboards
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+    grafana_dashboard: "1"
+  annotations:
+    grafana_folder: ResaFlow
+data:
+  {{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+  {{ base $path }}: |-
+    {{- $.Files.Get $path | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}

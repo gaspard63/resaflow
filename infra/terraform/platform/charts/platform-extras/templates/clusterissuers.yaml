@@ -1,0 +1,18 @@
+{{- /* letsencrypt-staging : tests (pas de limite de débit) ; letsencrypt-prod : certificats reconnus */ -}}
+{{- range $name, $server := dict "letsencrypt-staging" "https://acme-staging-v02.api.letsencrypt.org/directory" "letsencrypt-prod" "https://acme-v02.api.letsencrypt.org/directory" }}
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ $name }}
+spec:
+  acme:
+    server: {{ $server }}
+    email: {{ required "acmeEmail requis" $.Values.acmeEmail | quote }}
+    privateKeySecretRef:
+      name: {{ $name }}-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: {{ $.Values.ingressClass }}
+{{- end }}

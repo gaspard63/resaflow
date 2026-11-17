@@ -1,0 +1,143 @@
+{{- /*
+API : Deployment "stable" (+ Deployment "canary" optionnel), Service, HPA, PDB.
+Le canary partage le même code de pod, seuls l'image et le label track changent.
+*/ -}}
+{{- $tracks := list (dict "track" "stable" "suffix" "" "tag" .Values.image.tag "replicas" .Values.api.replicas) -}}
+{{- if .Values.canary.enabled -}}
+{{- $tracks = append $tracks (dict "track" "canary" "suffix" "-canary" "tag" (required "canary.tag requis" .Values.canary.tag) "replicas" .Values.canary.replicas) -}}
+{{- end -}}
+{{- range $t := $tracks }}
+{{- with $ }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: resaflow-api{{ $t.suffix }}
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+    resaflow.io/track: {{ $t.track }}
+spec:
+  {{- if or (eq $t.track "canary") (not .Values.api.autoscaling.enabled) }}
+  replicas: {{ $t.replicas }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      {{- include "resaflow.selector" (dict "ctx" . "component" "api") | nindent 6 }}
+      resaflow.io/track: {{ $t.track }}
+  # Rolling update sans perte de capacité : un pod neuf doit être Ready avant d'en retirer un ancien
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        {{- include "resaflow.selector" (dict "ctx" . "component" "api") | nindent 8 }}
+        resaflow.io/track: {{ $t.track }}
+        {{- include "resaflow.podLabels" (dict "ctx" .) | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print .Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      automountServiceAccountToken: false   # le webhook Workload Identity projette son propre jeton
+      {{- include "resaflow.podSecurity" (dict) | nindent 6 }}
+      {{- include "resaflow.spread" (dict "ctx" . "component" "api") | nindent 6 }}
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: api
+          image: {{ include "resaflow.image" (dict "ctx" . "name" .Values.image.api "tag" $t.tag) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - { name: http, containerPort: 8000 }
+          {{- include "resaflow.backendEnv" . | nindent 10 }}
+          readinessProbe:
+            httpGet: { path: /health/ready, port: http }
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /health/live, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          startupProbe:
+            httpGet: { path: /health/live, port: http }
+            periodSeconds: 2
+            failureThreshold: 30
+          lifecycle:
+            # laisse le temps à l'Ingress de retirer le pod avant l'arrêt (zéro requête perdue)
+            preStop:
+              sleep: { seconds: 5 }
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+          {{- include "resaflow.containerSecurity" . | nindent 10 }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            {{- include "resaflow.kvMount" . | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+        {{- include "resaflow.kvVolume" . | nindent 8 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: resaflow-api{{ $t.suffix }}
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+    resaflow.io/track: {{ $t.track }}
+spec:
+  selector:
+    {{- include "resaflow.selector" (dict "ctx" . "component" "api") | nindent 4 }}
+    resaflow.io/track: {{ $t.track }}
+  ports:
+    - { name: http, port: 8000, targetPort: http }
+{{- end }}
+{{- end }}
+{{- if .Values.api.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: resaflow-api
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: resaflow-api
+  minReplicas: {{ .Values.api.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.api.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.api.autoscaling.targetCPUUtilizationPercentage }}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 30 }
+    scaleDown:
+      stabilizationWindowSeconds: 120     # évite le yo-yo après un pic
+      policies:
+        - { type: Pods, value: 1, periodSeconds: 60 }
+{{- end }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: resaflow-api
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.api.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "resaflow.selector" (dict "ctx" . "component" "api") | nindent 6 }}
+      resaflow.io/track: stable

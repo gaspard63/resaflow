@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: resaflow-frontend
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: frontend
+spec:
+  replicas: {{ .Values.frontend.replicas }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      {{- include "resaflow.selector" (dict "ctx" . "component" "frontend") | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels:
+        {{- include "resaflow.selector" (dict "ctx" . "component" "frontend") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- include "resaflow.podSecurity" (dict "uid" 101) | nindent 6 }}
+      {{- include "resaflow.spread" (dict "ctx" . "component" "frontend") | nindent 6 }}
+      containers:
+        - name: frontend
+          image: {{ include "resaflow.image" (dict "ctx" . "name" .Values.image.frontend) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: BACKEND_UPSTREAM
+              value: http://resaflow-api:8000
+          ports:
+            - { name: http, containerPort: 8080 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.frontend.resources | nindent 12 }}
+          {{- include "resaflow.containerSecurity" . | nindent 10 }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            - { name: nginx-conf, mountPath: /etc/nginx/conf.d }
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 32Mi }
+        - name: nginx-conf          # cible du rendu envsubst du template Nginx
+          emptyDir: { sizeLimit: 1Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: resaflow-frontend
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: frontend
+spec:
+  selector:
+    {{- include "resaflow.selector" (dict "ctx" . "component" "frontend") | nindent 4 }}
+  ports:
+    - { name: http, port: 80, targetPort: http }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: resaflow-frontend
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.frontend.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "resaflow.selector" (dict "ctx" . "component" "frontend") | nindent 6 }}

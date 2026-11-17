@@ -1,0 +1,23 @@
+# Environnement de développement (namespace resaflow-dev) : minimal et économique
+environment: dev
+config:
+  logLevel: DEBUG
+api:
+  resources:
+    requests: { cpu: 50m, memory: 160Mi }
+    limits: { cpu: 300m, memory: 320Mi }
+  autoscaling: { enabled: true, minReplicas: 1, maxReplicas: 3, targetCPUUtilizationPercentage: 70 }
+  pdb: { minAvailable: 0 }
+worker:
+  autoscaling: { enabled: false }
+  replicas: 1
+frontend:
+  replicas: 1
+  pdb: { minAvailable: 0 }
+postgresql:
+  enabled: true
+  size: 4Gi
+backup:
+  enabled: false
+monitoring:
+  dashboards: false

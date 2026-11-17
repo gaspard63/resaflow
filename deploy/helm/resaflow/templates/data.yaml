@@ -1,0 +1,294 @@
+{{- /*
+Services de données in-cluster, persistés sur des PersistentVolumes (disques Azure managés, chiffrés au repos).
+- PostgreSQL : dev/staging uniquement (en prod : Azure Database for PostgreSQL Flexible Server, cf. Terraform)
+- RabbitMQ   : tous les environnements (broker Celery)
+- Mailpit    : SMTP de démonstration
+*/ -}}
+{{- if .Values.postgresql.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: resaflow-postgresql
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql
+spec:
+  serviceName: resaflow-postgresql
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "resaflow.selector" (dict "ctx" . "component" "postgresql") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "resaflow.selector" (dict "ctx" . "component" "postgresql") | nindent 8 }}
+        {{- include "resaflow.podLabels" (dict "ctx" .) | nindent 8 }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      automountServiceAccountToken: false
+      {{- include "resaflow.podSecurity" (dict "uid" 70) | nindent 6 }}
+      containers:
+        - name: postgresql
+          image: {{ .Values.postgresql.image }}
+          ports:
+            - { name: postgres, containerPort: 5432 }
+          env:
+            - { name: POSTGRES_DB, value: {{ .Values.postgresql.database | quote }} }
+            - { name: POSTGRES_USER, value: {{ .Values.postgresql.user | quote }} }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: {{ include "resaflow.secretName" . }}, key: POSTGRES_PASSWORD } }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          readinessProbe:
+            exec: { command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""] }
+            periodSeconds: 5
+          livenessProbe:
+            exec: { command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\""] }
+            periodSeconds: 15
+            initialDelaySeconds: 30
+          resources:
+            {{- toYaml .Values.postgresql.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+            - { name: run, mountPath: /var/run/postgresql }
+            - { name: tmp, mountPath: /tmp }
+            {{- include "resaflow.kvMount" . | nindent 12 }}
+      volumes:
+        - { name: run, emptyDir: {} }
+        - { name: tmp, emptyDir: {} }
+        {{- include "resaflow.kvVolume" . | nindent 8 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.postgresql.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.postgresql.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: resaflow-postgresql
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql
+spec:
+  selector:
+    {{- include "resaflow.selector" (dict "ctx" . "component" "postgresql") | nindent 4 }}
+  ports:
+    - { name: postgres, port: 5432, targetPort: postgres }
+---
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: resaflow-rabbitmq
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+data:
+  enabled_plugins: "[rabbitmq_management,rabbitmq_prometheus]."
+  rabbitmq.conf: |
+    loopback_users.guest = false
+    default_user = {{ .Values.rabbitmq.user }}
+    # alarme mémoire : bloque les producteurs avant l'OOM du conteneur
+    vm_memory_high_watermark.relative = 0.6
+    disk_free_limit.absolute = 200MB
+    prometheus.return_per_object_metrics = true
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: resaflow-rabbitmq
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: rabbitmq
+spec:
+  serviceName: resaflow-rabbitmq
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "resaflow.selector" (dict "ctx" . "component" "rabbitmq") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "resaflow.selector" (dict "ctx" . "component" "rabbitmq") | nindent 8 }}
+        {{- include "resaflow.podLabels" (dict "ctx" .) | nindent 8 }}
+      annotations:
+        checksum/config: {{ .Values.rabbitmq | toJson | sha256sum }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      automountServiceAccountToken: false
+      hostname: rabbitmq                # nom de nœud Erlang stable entre redémarrages
+      {{- include "resaflow.podSecurity" (dict "uid" 999) | nindent 6 }}
+      containers:
+        - name: rabbitmq
+          image: {{ .Values.rabbitmq.image }}
+          ports:
+            - { name: amqp, containerPort: 5672 }
+            - { name: metrics, containerPort: 15692 }
+          env:
+            - name: RABBITMQ_DEFAULT_PASS
+              valueFrom: { secretKeyRef: { name: {{ include "resaflow.secretName" . }}, key: RABBITMQ_PASSWORD } }
+            - { name: RABBITMQ_NODENAME, value: "rabbit@rabbitmq" }
+          readinessProbe:
+            exec: { command: ["rabbitmq-diagnostics", "-q", "check_port_connectivity"] }
+            periodSeconds: 15
+            timeoutSeconds: 10
+          livenessProbe:
+            exec: { command: ["rabbitmq-diagnostics", "-q", "status"] }
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 15
+          resources:
+            {{- toYaml .Values.rabbitmq.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/rabbitmq }
+            - { name: config, mountPath: /etc/rabbitmq/rabbitmq.conf, subPath: rabbitmq.conf }
+            - { name: config, mountPath: /etc/rabbitmq/enabled_plugins, subPath: enabled_plugins }
+            {{- include "resaflow.kvMount" . | nindent 12 }}
+      volumes:
+        - name: config
+          configMap: { name: resaflow-rabbitmq }
+        {{- include "resaflow.kvVolume" . | nindent 8 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.rabbitmq.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.rabbitmq.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: resaflow-rabbitmq
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: rabbitmq
+spec:
+  selector:
+    {{- include "resaflow.selector" (dict "ctx" . "component" "rabbitmq") | nindent 4 }}
+  ports:
+    - { name: amqp, port: 5672, targetPort: amqp }
+    - { name: metrics, port: 15692, targetPort: metrics }
+{{- if .Values.mailpit.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: resaflow-mailpit
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mailpit
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "resaflow.selector" (dict "ctx" . "component" "mailpit") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "resaflow.selector" (dict "ctx" . "component" "mailpit") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- include "resaflow.podSecurity" (dict "uid" 1000) | nindent 6 }}
+      containers:
+        - name: mailpit
+          image: {{ .Values.mailpit.image }}
+          ports:
+            - { name: smtp, containerPort: 1025 }
+            - { name: ui, containerPort: 8025 }
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 100m, memory: 128Mi }
+          {{- include "resaflow.containerSecurity" . | nindent 10 }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            - { name: data, mountPath: /data }
+      volumes:
+        - { name: tmp, emptyDir: {} }
+        - { name: data, emptyDir: { sizeLimit: 256Mi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: resaflow-mailpit
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mailpit
+spec:
+  selector:
+    {{- include "resaflow.selector" (dict "ctx" . "component" "mailpit") | nindent 4 }}
+  ports:
+    - { name: smtp, port: 1025, targetPort: smtp }
+    - { name: ui, port: 8025, targetPort: ui }
+{{- end }}
+{{- if .Values.azurite.enabled }}
+---
+# Émulateur Azure Blob : UNIQUEMENT pour un cluster local (kind, Docker Desktop) sans compte Azure.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: resaflow-azurite
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: azurite
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "resaflow.selector" (dict "ctx" . "component" "azurite") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "resaflow.selector" (dict "ctx" . "component" "azurite") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- include "resaflow.podSecurity" (dict "uid" 1000) | nindent 6 }}
+      containers:
+        - name: azurite
+          image: {{ .Values.azurite.image }}
+          args: ["azurite-blob", "--blobHost", "0.0.0.0", "--location", "/data", "--loose", "--skipApiVersionCheck", "--disableTelemetry"]
+          ports:
+            - { name: blob, containerPort: 10000 }
+          readinessProbe:
+            tcpSocket: { port: blob }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+            limits: { cpu: 200m, memory: 256Mi }
+          {{- include "resaflow.containerSecurity" . | nindent 10 }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            - { name: data, mountPath: /data }
+      volumes:
+        - { name: tmp, emptyDir: {} }
+        - { name: data, emptyDir: { sizeLimit: 1Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: resaflow-azurite
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: azurite
+spec:
+  selector:
+    {{- include "resaflow.selector" (dict "ctx" . "component" "azurite") | nindent 4 }}
+  ports:
+    - { name: blob, port: 10000, targetPort: blob }
+{{- end }}

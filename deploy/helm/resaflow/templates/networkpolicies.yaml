@@ -1,0 +1,177 @@
+{{- /*
+Micro-segmentation réseau (moindre privilège, A.8.22/A.5.15) :
+tout est refusé par défaut, puis chaque flux nécessaire est ouvert explicitement.
+*/ -}}
+{{- if .Values.networkPolicies.enabled }}
+{{- $ns := .Values.networkPolicies -}}
+{{- $sel := dict "ctx" . -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  labels: {{- include "resaflow.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  labels: {{- include "resaflow.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+          podSelector: { matchLabels: { k8s-app: kube-dns } }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+# Front : reçoit le trafic de l'Ingress, peut joindre l'API (repli /api de Nginx)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend
+  labels: {{- include "resaflow.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/component: frontend }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ $ns.ingressNamespace }} } }
+      ports: [{ port: 8080 }]
+  egress:
+    - to: [{ podSelector: { matchLabels: { app.kubernetes.io/component: api } } }]
+      ports: [{ port: 8000 }]
+---
+# API : Ingress + front + Prometheus en entrée ; base, broker, Azure (443) et Tempo en sortie
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api
+  labels: {{- include "resaflow.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/component: api }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ $ns.ingressNamespace }} } }
+        - podSelector: { matchLabels: { app.kubernetes.io/component: frontend } }
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ $ns.monitoringNamespace }} } }
+      ports: [{ port: 8000 }]
+  egress:
+    {{- include "resaflow.np.backendEgress" . | nindent 4 }}
+---
+# Worker : seul Prometheus l'interroge ; mêmes sorties que l'API + SMTP
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: worker
+  labels: {{- include "resaflow.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/component: worker }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ $ns.monitoringNamespace }} } }
+      ports: [{ port: 9100 }]
+  egress:
+    {{- include "resaflow.np.backendEgress" . | nindent 4 }}
+    - to: [{ podSelector: { matchLabels: { app.kubernetes.io/component: mailpit } } }]
+      ports: [{ port: 1025 }]
+    - ports: [{ port: 587 }]          # relais SMTP externe éventuel (STARTTLS)
+---
+# Beat, migration, sauvegarde : uniquement sortants
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jobs-and-beat
+  labels: {{- include "resaflow.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app.kubernetes.io/component, operator: In, values: [beat, migrate, backup] }
+  policyTypes: [Ingress, Egress]
+  egress:
+    {{- include "resaflow.np.backendEgress" . | nindent 4 }}
+{{- if .Values.postgresql.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgresql
+  labels: {{- include "resaflow.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/component: postgresql }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - { key: app.kubernetes.io/component, operator: In, values: [api, worker, beat, migrate, backup] }
+      ports: [{ port: 5432 }]
+  egress:
+    - ports: [{ port: 443 }]          # CSI Key Vault / Entra ID
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rabbitmq
+  labels: {{- include "resaflow.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/component: rabbitmq }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - { key: app.kubernetes.io/component, operator: In, values: [api, worker, beat] }
+      ports: [{ port: 5672 }]
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ $ns.monitoringNamespace }} } }
+      ports: [{ port: 15692 }]
+  egress:
+    - ports: [{ port: 443 }]
+{{- if .Values.mailpit.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mailpit
+  labels: {{- include "resaflow.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/component: mailpit }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from: [{ podSelector: { matchLabels: { app.kubernetes.io/component: worker } } }]
+      ports: [{ port: 1025 }]
+{{- end }}
+{{- end }}
+
+{{- define "resaflow.np.backendEgress" -}}
+{{- if .Values.postgresql.enabled }}
+- to: [{ podSelector: { matchLabels: { app.kubernetes.io/component: postgresql } } }]
+  ports: [{ port: 5432 }]
+{{- else }}
+- to: [{ ipBlock: { cidr: {{ .Values.externalDatabase.cidr }} } }]
+  ports: [{ port: 5432 }]
+{{- end }}
+- to: [{ podSelector: { matchLabels: { app.kubernetes.io/component: rabbitmq } } }]
+  ports: [{ port: 5672 }]
+- to:
+    - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicies.monitoringNamespace }} } }
+  ports: [{ port: 4318 }]
+# Azure Blob Storage, Key Vault, Entra ID (jetons Workload Identity) : HTTPS uniquement
+- to: [{ ipBlock: { cidr: 0.0.0.0/0, except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16] } }]
+  ports: [{ port: 443 }]
+{{- end -}}

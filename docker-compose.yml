@@ -1,0 +1,143 @@
+# Stack locale complète : front + API + worker + beat + PostgreSQL + RabbitMQ + Azurite (Blob) + Mailpit.
+#   docker compose up -d --build
+#   -> http://localhost:8080 (application), http://localhost:8025 (e-mails), http://localhost:15672 (RabbitMQ)
+# Supervision locale (optionnelle) : docker compose --profile observability up -d
+#   -> http://localhost:3000 (Grafana), http://localhost:9090 (Prometheus)
+#
+# Les secrets viennent du fichier .env (non versionné) : copier .env.example en .env.
+
+name: resaflow
+
+x-backend-env: &backend-env
+  APP_ENV: dev
+  LOG_LEVEL: INFO
+  DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  JWT_SECRET: ${JWT_SECRET}
+  CELERY_BROKER_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672//
+  STORAGE_BACKEND: azure
+  AZURE_STORAGE_CONNECTION_STRING: ${AZURITE_CONNECTION_STRING}
+  SMTP_HOST: mailpit
+  SMTP_PORT: "1025"
+  ADMIN_EMAIL: ${ADMIN_EMAIL}
+  ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+
+x-hardening: &hardening
+  read_only: true
+  tmpfs: [/tmp]
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports: ["127.0.0.1:5432:5432"]
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    volumes:
+      - rabbitmq:/var/lib/rabbitmq
+      - ./observability/local/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    ports: ["127.0.0.1:15672:15672"]
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.37.0
+    command: ["azurite-blob", "--blobHost", "0.0.0.0", "--loose", "--skipApiVersionCheck", "--disableTelemetry"]
+    volumes: [azurite:/data]
+    ports: ["127.0.0.1:10000:10000"]
+
+  mailpit:
+    image: axllent/mailpit:v1.31.4
+    ports: ["127.0.0.1:8025:8025"]
+
+  migrate:
+    build: { context: ./backend, target: worker }
+    image: resaflow-worker:local
+    command: ["sh", "-c", "alembic upgrade head && python -m app.cli seed"]
+    environment: *backend-env
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+    <<: *hardening
+
+  api:
+    build: { context: ./backend, target: api }
+    image: resaflow-api:local
+    environment: *backend-env
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      rabbitmq: { condition: service_healthy }
+      azurite: { condition: service_started }
+    ports: ["127.0.0.1:8000:8000"]
+    <<: *hardening
+
+  worker:
+    image: resaflow-worker:local
+    environment: *backend-env
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      rabbitmq: { condition: service_healthy }
+    <<: *hardening
+
+  beat:
+    image: resaflow-worker:local
+    command: ["celery", "-A", "app.worker.celery_app", "beat", "--loglevel=INFO", "--schedule=/tmp/celerybeat-schedule"]
+    environment: *backend-env
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      worker: { condition: service_started }
+    <<: *hardening
+
+  frontend:
+    build: { context: ./frontend }
+    image: resaflow-frontend:local
+    environment:
+      BACKEND_UPSTREAM: http://api:8000
+    depends_on: [api]
+    ports: ["127.0.0.1:8080:8080"]
+    read_only: true
+    tmpfs: [/tmp, /etc/nginx/conf.d]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+
+  # ---------- Supervision locale (profil "observability") ----------
+  prometheus:
+    profiles: [observability]
+    image: prom/prometheus:v3.14.0
+    volumes:
+      - ./observability/local/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["127.0.0.1:9090:9090"]
+
+  grafana:
+    profiles: [observability]
+    image: grafana/grafana:13.2.3
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./observability/local/grafana-provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/helm/resaflow/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["127.0.0.1:3000:3000"]
+    depends_on: [prometheus]
+
+volumes:
+  pgdata:
+  rabbitmq:
+  azurite:

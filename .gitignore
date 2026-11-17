@@ -1,0 +1,40 @@
+# Secrets et configuration locale (jamais versionnés — A.8.12)
+.env
+.env.*
+!.env.example
+*.tfvars
+!*.tfvars.example
+backend.hcl
+secrets.local.yaml
+*.pem
+*.key
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+tfplan
+plan.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.db
+
+# Node
+node_modules/
+dist/
+coverage/
+
+# Divers
+.DS_Store
+.idea/
+.vscode/
+hpa-k6-summary.json
+finops-couts-quotidiens.csv

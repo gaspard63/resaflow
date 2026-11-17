@@ -1,0 +1,136 @@
+{{- /*
+Exposition HTTPS via Traefik (contrôleur d'entrée maintenu ; ingress-nginx n'est plus maintenu depuis mars 2026).
+- Certificate      : certificat TLS Let's Encrypt émis par cert-manager (chiffrement en transit, A.8.24)
+- Middlewares      : en-têtes de sécurité, limitation de débit sur /api/v1/auth (anti brute-force, A.8.5)
+- IngressRoute     : / -> front, /api -> API (ou répartition pondérée stable/canary)
+- TraefikService   : répartition pondérée du trafic /api pendant un déploiement canary
+*/ -}}
+{{- if .Values.ingress.enabled }}
+{{- $ns := .Release.Namespace -}}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: resaflow-tls
+  labels: {{- include "resaflow.labels" . | nindent 4 }}
+spec:
+  secretName: resaflow-tls
+  dnsNames: [{{ .Values.ingress.host | quote }}]
+  issuerRef:
+    kind: ClusterIssuer
+    name: {{ .Values.ingress.clusterIssuer }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: security-headers
+  labels: {{- include "resaflow.labels" . | nindent 4 }}
+spec:
+  headers:
+    stsSeconds: 31536000
+    stsIncludeSubdomains: true
+    frameDeny: true
+    contentTypeNosniff: true
+    referrerPolicy: no-referrer
+    customResponseHeaders:
+      Server: ""
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: auth-ratelimit
+  labels: {{- include "resaflow.labels" . | nindent 4 }}
+spec:
+  rateLimit:
+    average: {{ .Values.ingress.authRateLimitRps }}
+    period: 1s
+    burst: {{ mul .Values.ingress.authRateLimitRps 3 }}
+    sourceCriterion:
+      ipStrategy:
+        depth: 0
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: upload-limit
+  labels: {{- include "resaflow.labels" . | nindent 4 }}
+spec:
+  buffering:
+    maxRequestBodyBytes: 6291456      # 6 Mo (l'API refuse au-delà de 5 Mo de fichier)
+{{- if .Values.canary.enabled }}
+---
+# Répartition pondérée : (100 - weight) % vers la version stable, weight % vers le canary
+apiVersion: traefik.io/v1alpha1
+kind: TraefikService
+metadata:
+  name: resaflow-api-weighted
+  labels: {{- include "resaflow.labels" . | nindent 4 }}
+spec:
+  weighted:
+    services:
+      - name: resaflow-api
+        port: 8000
+        weight: {{ sub 100 (int .Values.canary.weight) }}
+      - name: resaflow-api-canary
+        port: 8000
+        weight: {{ int .Values.canary.weight }}
+{{- end }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: resaflow
+  labels: {{- include "resaflow.labels" . | nindent 4 }}
+spec:
+  entryPoints: [websecure]
+  routes:
+    # Authentification : toujours la version stable, avec limitation de débit par IP
+    - kind: Rule
+      match: Host(`{{ .Values.ingress.host }}`) && PathPrefix(`/api/v1/auth`)
+      priority: 100
+      middlewares:
+        - name: auth-ratelimit
+        - name: security-headers
+      services:
+        - name: resaflow-api
+          port: 8000
+    {{- if .Values.canary.enabled }}
+    # Tests de fumée du pipeline : "X-Canary: always" force le canary
+    - kind: Rule
+      match: Host(`{{ .Values.ingress.host }}`) && PathPrefix(`/api`) && Header(`X-Canary`, `always`)
+      priority: 90
+      middlewares:
+        - name: upload-limit
+        - name: security-headers
+      services:
+        - name: resaflow-api-canary
+          port: 8000
+    {{- end }}
+    - kind: Rule
+      match: Host(`{{ .Values.ingress.host }}`) && PathPrefix(`/api`)
+      priority: 50
+      middlewares:
+        - name: upload-limit
+        - name: security-headers
+      services:
+        {{- if .Values.canary.enabled }}
+        - name: resaflow-api-weighted
+          kind: TraefikService
+        {{- else }}
+        - name: resaflow-api
+          port: 8000
+        {{- end }}
+    - kind: Rule
+      match: Host(`{{ .Values.ingress.host }}`)
+      priority: 10
+      middlewares:
+        - name: security-headers
+      services:
+        - name: resaflow-frontend
+          port: 80
+  tls:
+    secretName: resaflow-tls
+{{- end }}

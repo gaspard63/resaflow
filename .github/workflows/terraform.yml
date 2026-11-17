@@ -1,0 +1,136 @@
+# Infrastructure as Code : plan sur chaque pull request, apply sur main après approbation
+# (environnement GitHub "infra" protégé). Deux stacks appliquées dans l'ordre : azure puis platform.
+name: terraform
+
+on:
+  pull_request:
+    paths: ["infra/terraform/**", ".github/workflows/terraform.yml"]
+  push:
+    branches: [main]
+    paths: ["infra/terraform/**", ".github/workflows/terraform.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform # jamais deux exécutions simultanées sur le même état
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.16.5"
+  TF_IN_AUTOMATION: "true"
+  ARM_USE_OIDC: "true"
+  ARM_USE_AZUREAD: "true"
+  ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID_TERRAFORM }}
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  static:
+    name: fmt, validate, scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - run: terraform fmt -check -recursive -diff infra/terraform
+      - name: validate (sans backend)
+        run: |
+          for stack in bootstrap azure platform; do
+            terraform -chdir=infra/terraform/$stack init -backend=false -input=false
+            terraform -chdir=infra/terraform/$stack validate
+          done
+      - name: Scan de sécurité IaC (Trivy)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: infra/terraform
+          severity: HIGH,CRITICAL
+          format: sarif
+          output: trivy-iac.sarif
+          exit-code: "0"
+      - uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        if: always()
+        with:
+          sarif_file: trivy-iac.sarif
+          category: trivy-iac
+
+  plan:
+    name: plan
+    needs: static
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - name: Fichiers de configuration (depuis les variables GitHub, aucun secret)
+        run: ./scripts/ci/tf-config.sh
+        env:
+          TF_BACKEND_HCL: ${{ vars.TF_BACKEND_HCL }}
+          TF_VARS_AZURE: ${{ vars.TF_VARS_AZURE }}
+      - name: terraform plan (azure)
+        run: |
+          cd infra/terraform/azure
+          terraform init -input=false -backend-config=backend.hcl -backend-config="key=azure.tfstate"
+          terraform plan -input=false -lock-timeout=5m -no-color -out=tfplan | tee plan.txt
+      - name: Commentaire du plan sur la PR
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('infra/terraform/azure/plan.txt', 'utf8');
+            const summary = (plan.match(/Plan: .*|No changes\..*/) || ['(voir les logs)'])[0];
+            const body = `### Terraform plan (stack azure)\n**${summary}**\n<details><summary>Détail</summary>\n\n\`\`\`\n${plan.slice(-60000)}\n\`\`\`\n</details>`;
+            await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+
+  apply:
+    name: apply
+    needs: static
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: infra # approbation manuelle requise
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - run: ./scripts/ci/tf-config.sh
+        env:
+          TF_BACKEND_HCL: ${{ vars.TF_BACKEND_HCL }}
+          TF_VARS_AZURE: ${{ vars.TF_VARS_AZURE }}
+          TF_VARS_PLATFORM: ${{ vars.TF_VARS_PLATFORM }}
+      - name: Connexion Azure CLI (pour kubelogin)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID_TERRAFORM }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - uses: azure/use-kubelogin@0ce7c36141aa27d4934872cf00b0120804c98a29 # v1.3
+        with:
+          kubelogin-version: v0.2.21
+      - name: terraform apply (azure)
+        run: |
+          cd infra/terraform/azure
+          terraform init -input=false -backend-config=backend.hcl -backend-config="key=azure.tfstate"
+          terraform apply -input=false -lock-timeout=5m -auto-approve
+      - name: terraform apply (platform)
+        run: |
+          cd infra/terraform/platform
+          terraform init -input=false -backend-config=backend.hcl -backend-config="key=platform.tfstate"
+          terraform apply -input=false -lock-timeout=5m -auto-approve

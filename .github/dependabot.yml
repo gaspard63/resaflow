@@ -1,0 +1,20 @@
+# Mises à jour de sécurité automatisées des dépendances (A.8.8 Gestion des vulnérabilités techniques)
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /backend
+    schedule: { interval: weekly }
+    groups: { python: { patterns: ["*"] } }
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule: { interval: weekly }
+    groups: { npm: { patterns: ["*"] } }
+  - package-ecosystem: docker
+    directories: [/backend, /frontend]
+    schedule: { interval: weekly }
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+  - package-ecosystem: terraform
+    directories: [/infra/terraform/azure, /infra/terraform/platform, /infra/terraform/bootstrap]
+    schedule: { interval: weekly }

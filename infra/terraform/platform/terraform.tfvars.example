@@ -1,0 +1,5 @@
+resource_group = "rg-resaflow-gs26"   # sortie resource_group de la stack azure
+aks_name       = "aks-resaflow-gs26"  # sortie aks_name
+deploy_identity_object_id = "<sortie github_deploy_principal_id>"
+acme_email     = "vous@exemple.fr"
+# alertmanager_webhook_url = "https://..."  (optionnel : Teams / Slack / Discord)

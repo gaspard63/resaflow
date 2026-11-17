@@ -1,0 +1,165 @@
+{{- /* Worker Celery (traitements asynchrones) + Celery beat (planificateur, 1 seul réplica). */ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: resaflow-worker
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  {{- if not .Values.worker.autoscaling.enabled }}
+  replicas: {{ .Values.worker.replicas }}
+  {{- end }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      {{- include "resaflow.selector" (dict "ctx" . "component" "worker") | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels:
+        {{- include "resaflow.selector" (dict "ctx" . "component" "worker") | nindent 8 }}
+        {{- include "resaflow.podLabels" (dict "ctx" .) | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print .Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      automountServiceAccountToken: false
+      {{- include "resaflow.podSecurity" (dict) | nindent 6 }}
+      {{- include "resaflow.spread" (dict "ctx" . "component" "worker") | nindent 6 }}
+      # Celery termine la tâche en cours sur SIGTERM ; acks_late garantit sa reprise si le délai expire
+      terminationGracePeriodSeconds: 60
+      {{- if .Values.worker.spot }}
+      # FinOps : nœuds Spot (jusqu'à -90 %) préférés mais pas obligatoires (repli sur le pool standard)
+      tolerations:
+        - key: kubernetes.azure.com/scalesetpriority
+          operator: Equal
+          value: spot
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.azure.com/scalesetpriority
+                    operator: In
+                    values: ["spot"]
+      {{- end }}
+      containers:
+        - name: worker
+          image: {{ include "resaflow.image" (dict "ctx" . "name" .Values.image.worker) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["celery", "-A", "app.worker.celery_app", "worker", "--pool=threads",
+                 "--concurrency={{ .Values.worker.concurrency }}", "--loglevel=INFO", "-Q", "resaflow",
+                 "--without-gossip", "--without-mingle"]
+          ports:
+            - { name: metrics, containerPort: 9100 }
+          {{- include "resaflow.backendEnv" . | nindent 10 }}
+          # Vivant tant que le serveur de métriques du worker répond
+          livenessProbe:
+            httpGet: { path: /metrics, port: metrics }
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: { path: /metrics, port: metrics }
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+          {{- include "resaflow.containerSecurity" . | nindent 10 }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            {{- include "resaflow.kvMount" . | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 128Mi }
+        {{- include "resaflow.kvVolume" . | nindent 8 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: resaflow-worker-metrics
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  selector:
+    {{- include "resaflow.selector" (dict "ctx" . "component" "worker") | nindent 4 }}
+  ports:
+    - { name: metrics, port: 9100, targetPort: metrics }
+{{- if .Values.worker.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: resaflow-worker
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: resaflow-worker }
+  minReplicas: {{ .Values.worker.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.worker.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: {{ .Values.worker.autoscaling.targetCPUUtilizationPercentage }} }
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+{{- end }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: resaflow-worker
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "resaflow.selector" (dict "ctx" . "component" "worker") | nindent 6 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: resaflow-beat
+  labels:
+    {{- include "resaflow.labels" . | nindent 4 }}
+    app.kubernetes.io/component: beat
+spec:
+  replicas: 1                          # un seul planificateur, sinon les tâches seraient dupliquées
+  revisionHistoryLimit: 5
+  strategy: { type: Recreate }         # jamais deux beat simultanés pendant une mise à jour
+  selector:
+    matchLabels:
+      {{- include "resaflow.selector" (dict "ctx" . "component" "beat") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "resaflow.selector" (dict "ctx" . "component" "beat") | nindent 8 }}
+        {{- include "resaflow.podLabels" (dict "ctx" .) | nindent 8 }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      automountServiceAccountToken: false
+      {{- include "resaflow.podSecurity" (dict) | nindent 6 }}
+      containers:
+        - name: beat
+          image: {{ include "resaflow.image" (dict "ctx" . "name" .Values.image.worker) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["celery", "-A", "app.worker.celery_app", "beat", "--loglevel=INFO",
+                 "--schedule=/tmp/celerybeat-schedule"]
+          {{- include "resaflow.backendEnv" . | nindent 10 }}
+          resources:
+            {{- toYaml .Values.beat.resources | nindent 12 }}
+          {{- include "resaflow.containerSecurity" . | nindent 10 }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            {{- include "resaflow.kvMount" . | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 16Mi }
+        {{- include "resaflow.kvVolume" . | nindent 8 }}

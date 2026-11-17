@@ -1,0 +1,65 @@
+# Optimisation FinOps n°2 : le cluster AKS et le serveur PostgreSQL sont arrêtés hors des heures
+# de travail (soirs et week-ends). Arrêtés, ils ne facturent plus le calcul (VM, vCores) ; seuls les
+# disques, l'IP publique et le stockage restent facturés. Gain mesuré : voir docs/finops.md.
+#
+# Les crons GitHub sont en UTC : 18:30 UTC = 20:30 Paris (heure d'été) / 19:30 (heure d'hiver).
+name: finops-schedule
+
+on:
+  schedule:
+    - cron: "30 18 * * 1-5"  # arrêt en semaine le soir
+    - cron: "15 6 * * 1-5"   # démarrage en semaine le matin
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "start ou stop"
+        required: true
+        type: choice
+        options: [start, stop]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  aks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Action à effectuer
+        id: what
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "action=${{ inputs.action }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event.schedule }}" == "30 18 * * 1-5" ]]; then
+            echo "action=stop" >> "$GITHUB_OUTPUT"
+          else
+            echo "action=start" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID_DEPLOY }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: az aks ${{ steps.what.outputs.action }}
+        run: |
+          STATE="$(az aks show -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "${{ vars.AKS_NAME }}" --query powerState.code -o tsv)"
+          echo "État actuel : $STATE"
+          if [[ "${{ steps.what.outputs.action }}" == "stop" && "$STATE" == "Running" ]]; then
+            az aks stop -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "${{ vars.AKS_NAME }}" --no-wait
+          elif [[ "${{ steps.what.outputs.action }}" == "start" && "$STATE" == "Stopped" ]]; then
+            az aks start -g "${{ vars.AZURE_RESOURCE_GROUP }}" -n "${{ vars.AKS_NAME }}" --no-wait
+          else
+            echo "AKS : rien à faire"
+          fi
+      - name: az postgres flexible-server ${{ steps.what.outputs.action }}
+        run: |
+          PG="${{ vars.POSTGRES_SERVER_NAME }}"; RG="${{ vars.AZURE_RESOURCE_GROUP }}"
+          STATE="$(az postgres flexible-server show -g "$RG" -n "$PG" --query state -o tsv)"
+          echo "État actuel : $STATE"
+          if [[ "${{ steps.what.outputs.action }}" == "stop" && "$STATE" == "Ready" ]]; then
+            az postgres flexible-server stop -g "$RG" -n "$PG" --no-wait
+          elif [[ "${{ steps.what.outputs.action }}" == "start" && "$STATE" == "Stopped" ]]; then
+            az postgres flexible-server start -g "$RG" -n "$PG" --no-wait
+          else
+            echo "PostgreSQL : rien à faire"
+          fi

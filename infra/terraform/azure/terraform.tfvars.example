@@ -1,0 +1,7 @@
+# Copier en terraform.tfvars (non versionné) et compléter.
+suffix                     = "gs26"                       # unique, 3-6 caractères
+github_repository          = "votre-compte/resaflow"
+admin_object_ids           = ["<az ad signed-in-user show --query id -o tsv>"]
+tfstate_storage_account_id = "<sortie tfstate_storage_account_id du bootstrap>"
+budget_amount              = 100
+budget_contact_emails      = ["vous@exemple.fr"]

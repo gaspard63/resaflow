@@ -1,0 +1,42 @@
+{{- /*
+RBAC Kubernetes (A.5.15 / A.8.2) : rôle "opérateur" limité au namespace, lecture seule
++ redémarrage contrôlé des Deployments. Pas d'accès aux Secrets, pas de "exec".
+Les droits de déploiement du pipeline sont gérés par Azure RBAC (Terraform), aussi limités au namespace.
+*/ -}}
+{{- if .Values.rbac.operatorsGroupObjectId }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: resaflow-operator
+  labels: {{- include "resaflow.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [pods, pods/log, services, endpoints, configmaps, events, persistentvolumeclaims]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [patch]                     # kubectl rollout restart
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers]
+    verbs: [get, list, watch]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [get, list, watch, create]  # lancer une sauvegarde manuelle depuis le CronJob
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: resaflow-operator
+  labels: {{- include "resaflow.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: resaflow-operator
+subjects:
+  - kind: Group
+    apiGroup: rbac.authorization.k8s.io
+    name: {{ .Values.rbac.operatorsGroupObjectId | quote }}
+{{- end }}
