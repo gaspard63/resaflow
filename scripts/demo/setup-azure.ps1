@@ -17,14 +17,20 @@ param(
     [int]$Budget = 100
 )
 $ErrorActionPreference = "Stop"
+# PowerShell 5.1 ne s'arrête pas quand un exécutable externe (terraform, az, gh) échoue :
+# chaque appel est vérifié par son code de retour.
+function Invoke-Checked([string]$What, [scriptblock]$Cmd) {
+    & $Cmd
+    if ($LASTEXITCODE -ne 0) { throw "Échec : $What (code $LASTEXITCODE). Corrigez puis relancez le script : il reprend l'existant." }
+}
 $root = Resolve-Path "$PSScriptRoot/../.."
 $tf = Join-Path $root "infra/terraform"
 $me = az ad signed-in-user show --query id -o tsv
 
 Write-Host "=== 1/4 Bootstrap de l'état Terraform ===" -ForegroundColor Magenta
 Push-Location "$tf/bootstrap"
-terraform init -input=false
-terraform apply -auto-approve -var "suffix=$Suffix"
+Invoke-Checked "init bootstrap" { terraform init -input=false }
+Invoke-Checked "apply bootstrap" { terraform apply -auto-approve "-var=suffix=$Suffix" }
 $backend = terraform output -raw backend_hcl
 $stateId = terraform output -raw tfstate_storage_account_id
 Pop-Location
@@ -41,8 +47,8 @@ budget_amount              = $Budget
 budget_contact_emails      = ["$Email"]
 "@ | Set-Content "$tf/azure/terraform.tfvars"
 Push-Location "$tf/azure"
-terraform init -input=false -reconfigure -backend-config=backend.hcl -backend-config="key=azure.tfstate"
-terraform apply -auto-approve
+Invoke-Checked "init azure" { terraform init -input=false -reconfigure "-backend-config=backend.hcl" "-backend-config=key=azure.tfstate" }
+Invoke-Checked "apply azure" { terraform apply -auto-approve }
 $out = terraform output -json | ConvertFrom-Json
 Pop-Location
 
@@ -53,11 +59,11 @@ aks_name                  = "$($out.aks_name.value)"
 deploy_identity_object_id = "$($out.github_deploy_principal_id.value)"
 acme_email                = "$Email"
 "@ | Set-Content "$tf/platform/terraform.tfvars"
-az aks get-credentials -g $out.resource_group.value -n $out.aks_name.value --overwrite-existing
-kubelogin convert-kubeconfig -l azurecli
+Invoke-Checked "get-credentials" { az aks get-credentials -g $out.resource_group.value -n $out.aks_name.value --overwrite-existing }
+Invoke-Checked "kubelogin" { kubelogin convert-kubeconfig -l azurecli }
 Push-Location "$tf/platform"
-terraform init -input=false -reconfigure -backend-config=backend.hcl -backend-config="key=platform.tfstate"
-terraform apply -auto-approve
+Invoke-Checked "init platform" { terraform init -input=false -reconfigure "-backend-config=backend.hcl" "-backend-config=key=platform.tfstate" }
+Invoke-Checked "apply platform" { terraform apply -auto-approve }
 $ip = terraform output -raw ingress_public_ip
 Pop-Location
 
