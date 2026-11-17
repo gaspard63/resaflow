@@ -1,7 +1,7 @@
 # Front-end : build Vite dans une image Node, puis service des fichiers statiques
 # par Nginx non privilégié (UID 101, port 8080). Image finale ≈ 25 Mo, sans Node ni sources.
 
-FROM node:24-alpine AS build
+FROM node:26-alpine AS build
 WORKDIR /src
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
