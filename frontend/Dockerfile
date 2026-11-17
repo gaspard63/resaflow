@@ -8,7 +8,7 @@ RUN npm ci --no-audit --no-fund
 COPY . .
 RUN npm run build
 
-FROM nginxinc/nginx-unprivileged:1.29-alpine AS runtime
+FROM nginxinc/nginx-unprivileged:1.31-alpine AS runtime
 LABEL org.opencontainers.image.title="resaflow-frontend"
 # L'upstream de l'API est injecté au démarrage par envsubst (templates officiels de l'image Nginx).
 ENV BACKEND_UPSTREAM=http://api:8000
