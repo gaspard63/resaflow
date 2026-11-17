@@ -287,7 +287,7 @@ jobs:
       - name: Tests de fumée
         run: ./scripts/ci/smoke-test.sh "https://${{ steps.deploy.outputs.host }}"
       - name: Test de charge léger (k6) — vérifie le SLO de latence avant la prod
-        uses: grafana/setup-k6-action@43b9fc21641a76002687994433dd586f56e791b1 # v1.2.2
+        uses: grafana/setup-k6-action@c47136d33d365efbeb9ae7266908b5dcf98cdece # v1.3.0
       - run: k6 run -e BASE_URL="https://${{ steps.deploy.outputs.host }}" -e VUS=10 -e DURATION=1m loadtest/k6-api.js
 
   deploy-prod:
