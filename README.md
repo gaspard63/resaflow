@@ -78,7 +78,19 @@ pip install -r requirements-dev.txt; pytest; ruff check .; bandit -c pyproject.t
 cd ..\frontend; npm ci; npm run lint; npm test; npm run build
 ```
 
-Kubernetes local sans Azure (Docker Desktop, kind) : copier `deploy/helm/resaflow/secrets.local.example.yaml` en `secrets.local.yaml`, puis suivre l'en-tête de ce fichier (détails : [`docs/deploiement.md`](docs/deploiement.md) §5).
+## Kubernetes local (Docker Desktop), sans compte Azure
+
+Prérequis : Docker Desktop avec Kubernetes activé, au moins 8 Go de mémoire et 25 Go de disque libres, `kubectl`, `helm`, `k6`.
+
+```powershell
+docker compose down                          # libère les ports 8000/8080
+./scripts/demo/setup-local-k8s.ps1           # metrics-server, kube-prometheus-stack, images, chart Helm (valeurs staging)
+kubectl get pods,svc,hpa -n resaflow-staging
+```
+
+Même chart qu'en production ; Key Vault est remplacé par un Secret (`secrets.local.yaml`, généré, ignoré par git), Blob par Azurite et l'Ingress par un Service LoadBalancer (API sur http://localhost:8000). Grafana : `kubectl port-forward -n monitoring svc/kube-prometheus-stack-grafana 3000:80` (admin / resaflow-local). Les scripts de `scripts/demo/` fonctionnent tels quels sur ce cluster.
+
+> **Abonnement Azure for Students** : AKS y est refusé (tailles de machines `_v7` seules autorisées, quota de 0 vCPU dans les régions permises). Le code Terraform est adapté à cette liste (`Standard_D2as_v7`, pool Spot limité à 1 nœud) ; avec un abonnement doté de quota, `setup-azure.ps1` déploie la plateforme complète sans autre changement. Les démonstrations du rapport ont été réalisées sur le cluster local.
 
 ## Déploiement sur Azure (depuis zéro)
 

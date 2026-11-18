@@ -51,8 +51,8 @@ flowchart TB
   subgraph RG["Groupe de ressources rg-resaflow-<suffixe> (France Central)"]
     subgraph VNET["VNet 10.20.0.0/16"]
       subgraph SAKS["snet-aks 10.20.0.0/23 (NSG : 80/443 entrants)"]
-        SYS["Pool système Standard_B2s_v2<br/>autoscaler 1→3"]
-        SPOT["Pool Spot Standard_D2as_v5<br/>autoscaler 0→3"]
+        SYS["Pool système Standard_D2as_v7<br/>autoscaler 1→3"]
+        SPOT["Pool Spot Standard_D2as_v7<br/>autoscaler 0→1 (quota Spot : 3 vCPU)"]
       end
       SPG["snet-postgres 10.20.2.0/24 (délégué)"]
     end

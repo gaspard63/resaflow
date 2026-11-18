@@ -113,7 +113,8 @@ services:
     depends_on: [api]
     ports: ["127.0.0.1:8080:8080"]
     read_only: true
-    tmpfs: [/tmp, /etc/nginx/conf.d]
+    # conf.d généré au démarrage par envsubst : le tmpfs doit appartenir à l'utilisateur nginx (UID 101)
+    tmpfs: ["/tmp:uid=101,gid=101", "/etc/nginx/conf.d:uid=101,gid=101"]
     security_opt: ["no-new-privileges:true"]
     cap_drop: [ALL]
 

@@ -3,6 +3,7 @@
 ## 1. Hypothèses de chiffrage
 
 - Région **France Central**, prix publics à la demande en **USD** (Azure facture en EUR au taux Microsoft du mois), relevés en octobre 2026 : VM `Standard_B2s_v2` 0,0944 $/h et `Standard_D2as_v5` 0,101 $/h ([azurespeed.com](https://www.azurespeed.com/AzureVmPricing/Regions/francecentral)) ; `Standard_D2as_v5` Spot 0,019 $/h ([devzero.io](https://www.devzero.io/instances/azure/Standard_D2as_v5)) ; PostgreSQL Flexible B1ms ≈ 14 $/mois ([bytebase.com](https://www.bytebase.com/dbcost/azure-flexible/instance/B1ms.md)).
+- **Tailles réelles** : l'abonnement *Azure for Students* n'autorise pour AKS que des tailles `_v7` ; le code Terraform utilise donc `Standard_D2as_v7` (pool Spot limité à 1 nœud). L'estimation ci-dessous, établie sur les tailles initialement prévues, reste un ordre de grandeur. Coût **réellement mesuré** du provisionnement du 17/11 (détruit le jour même) : **< 0,01 €** (Azure Cost Management).
 - Postes marqués « ≈ » : ordres de grandeur des grilles publiques (disques, load balancer, ACR, stockage), **à confirmer** dans la [calculatrice Azure](https://azure.microsoft.com/pricing/calculator/) puis par la **facture réelle** (§4).
 - Mois = 730 h. Plage d'ouverture : lundi–vendredi, 06:15–18:30 UTC (12,25 h × ~21,7 jours ≈ **266 h**, soit 36 % du temps).
 - Une seule plateforme héberge les trois environnements (un cluster, trois namespaces).
