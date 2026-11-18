@@ -55,7 +55,7 @@ variable "kubernetes_version" {
 variable "system_node_vm_size" {
   description = "Taille des nœuds du pool système (exécute aussi les charges applicatives)"
   type        = string
-  default     = "Standard_B2s_v2"
+  default     = "Standard_D2as_v7"
 }
 
 variable "system_node_min" {
@@ -71,7 +71,7 @@ variable "system_node_max" {
 variable "spot_node_vm_size" {
   description = "Taille des nœuds Spot (workers Celery)"
   type        = string
-  default     = "Standard_D2as_v5"
+  default     = "Standard_D2as_v7"
 }
 
 variable "spot_node_max" {
@@ -104,7 +104,7 @@ variable "budget_contact_emails" {
 variable "budget_start_date" {
   description = "1er jour du mois de démarrage du budget (format AAAA-MM-01T00:00:00Z)"
   type        = string
-  default     = "2026-10-01T00:00:00Z"
+  default     = "2026-11-01T00:00:00Z"
 }
 
 variable "enable_private_endpoints" {

@@ -2,8 +2,15 @@
 
 function Get-ResaflowUrl {
     param([Parameter(Mandatory)][string]$Namespace)
+    $old = $ErrorActionPreference; $ErrorActionPreference = "Continue"   # PS 5.1 : stderr natif = exception sinon
     $hostName = kubectl get ingressroute resaflow -n $Namespace -o jsonpath='{.spec.routes[0].match}' 2>$null
-    if (-not $hostName) { throw "IngressRoute introuvable dans $Namespace (application déployée ?)" }
+    $local = kubectl get svc resaflow-api-local -n $Namespace --ignore-not-found -o name 2>$null
+    $ErrorActionPreference = $old
+    if (-not $hostName) {
+        # Cluster local (Docker Desktop) : pas d'Ingress, l'API est exposée par un Service LoadBalancer
+        if ($local) { return "http://localhost:8000" }
+        throw "IngressRoute introuvable dans $Namespace (application déployée ?)"
+    }
     $hostName = ($hostName -split '`')[1]
     return "https://$hostName"
 }

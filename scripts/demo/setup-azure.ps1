@@ -45,6 +45,7 @@ admin_object_ids           = ["$me"]
 tfstate_storage_account_id = "$stateId"
 budget_amount              = $Budget
 budget_contact_emails      = ["$Email"]
+budget_start_date          = "$((Get-Date -Day 1).ToString('yyyy-MM-01'))T00:00:00Z"
 "@ | Set-Content "$tf/azure/terraform.tfvars"
 Push-Location "$tf/azure"
 Invoke-Checked "init azure" { terraform init -input=false -reconfigure "-backend-config=backend.hcl" "-backend-config=key=azure.tfstate" }

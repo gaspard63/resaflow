@@ -1,0 +1,25 @@
+# kube-prometheus-stack pour le Kubernetes LOCAL de Docker Desktop (même logique que infra/terraform/platform/observability.tf)
+kubeControllerManager: { enabled: false }
+kubeScheduler: { enabled: false }
+kubeEtcd: { enabled: false }
+kubeProxy: { enabled: false }
+nodeExporter: { enabled: false }   # inutile (et souvent en échec) sur la VM de Docker Desktop
+prometheus:
+  prometheusSpec:
+    retention: 2d
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    resources:
+      requests: { cpu: 100m, memory: 512Mi }
+alertmanager:
+  alertmanagerSpec:
+    resources:
+      requests: { cpu: 10m, memory: 64Mi }
+grafana:
+  adminPassword: resaflow-local      # cluster local uniquement
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      searchNamespace: ALL
