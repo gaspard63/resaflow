@@ -163,7 +163,7 @@ jobs:
   # ===================================================================== BUILD, SCAN, PUSH
   images:
     name: Image ${{ matrix.image }}
-        if: github.event_name != 'pull_request' && vars.AZURE_CLIENT_ID_DEPLOY != ''
+    if: github.event_name != 'pull_request' && vars.AZURE_CLIENT_ID_DEPLOY != ''
     needs: [backend, frontend, security, helm]
     runs-on: ubuntu-latest
     permissions:
